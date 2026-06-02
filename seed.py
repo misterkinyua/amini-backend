@@ -3,13 +3,10 @@ Amini Platform · Database Seeder
 Run once after the database is created:  python3 seed.py
 """
 
-import json, hashlib, sys, os
+import json, sys, os
 sys.path.insert(0, os.path.dirname(__file__))
 
-from app import create_tables, SessionLocal, User, Vouch, Message, VouchRequest, Pipeline, ProfileView
-
-def hash_pw(pw):
-    return hashlib.sha256(pw.encode()).hexdigest()
+from app import create_tables, SessionLocal, User, Vouch, Message, VouchRequest, Pipeline, ProfileView, hash_pw
 
 # ── SEED DATA (mirrors store.js SEED) ─────────────────────────────────────────
 

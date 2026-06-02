@@ -6,12 +6,14 @@ Default DB  : sqlite:///amini.db
 MySQL switch: set DATABASE_URL=mysql+pymysql://user:pass@localhost/amini
 """
 
-import os, json, secrets, hashlib
-from datetime import datetime
+import os, json, secrets, re
+from datetime import datetime, timedelta
+from functools import wraps
 from flask import Flask, request, jsonify, g
 from flask_cors import CORS
 from sqlalchemy import create_engine, Column, String, Integer, Float, Boolean, Text, DateTime, ForeignKey, or_
-from sqlalchemy.orm import declarative_base, sessionmaker, relationship
+from sqlalchemy.orm import declarative_base, sessionmaker
+from werkzeug.security import generate_password_hash, check_password_hash
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -20,9 +22,14 @@ app = Flask(__name__)
 CORS(app, origins=["http://localhost:3456", "http://127.0.0.1:3456"], supports_credentials=True)
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "sqlite:///amini.db")
+TOKEN_TTL_DAYS = int(os.environ.get("TOKEN_TTL_DAYS", "7"))
+ALLOWED_ROLES  = {"candidate", "hr"}          # users cannot self-register as admin
+
 engine       = create_engine(DATABASE_URL, connect_args={"check_same_thread": False} if "sqlite" in DATABASE_URL else {})
 SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False)
 Base         = declarative_base()
+
+EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 
 # ── MODELS ────────────────────────────────────────────────────────────────────
@@ -219,13 +226,26 @@ def close_db(e=None):
     if db: db.close()
 
 def hash_pw(pw):
-    return hashlib.sha256(pw.encode()).hexdigest()
+    """Hash password with pbkdf2:sha256 and a random salt."""
+    return generate_password_hash(pw, method="pbkdf2:sha256")
+
+def verify_pw(stored_hash, password):
+    """Verify a password against its stored hash."""
+    return check_password_hash(stored_hash, password)
 
 def current_user(db):
+    """Return the User for the request token, or None if missing / expired / invalid."""
     token = request.headers.get("X-Auth-Token")
-    if not token: return None
+    if not token:
+        return None
     row = db.get(AuthToken, token)
-    if not row: return None
+    if not row:
+        return None
+    # Enforce token TTL
+    if datetime.utcnow() - row.created_at > timedelta(days=TOKEN_TTL_DAYS):
+        db.delete(row)
+        db.commit()
+        return None
     return db.get(User, row.user_id)
 
 def ok(data={}, code=200):
@@ -234,6 +254,36 @@ def ok(data={}, code=200):
 def err(msg, code=400):
     return jsonify({"error": msg}), code
 
+# ── AUTH DECORATORS ───────────────────────────────────────────────────────────
+
+def require_auth(f):
+    """Require a valid auth token. Injects `g.current_user`."""
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        db   = get_db()
+        user = current_user(db)
+        if not user:
+            return err("Authentication required", 401)
+        g.current_user = user
+        return f(*args, **kwargs)
+    return decorated
+
+def require_role(*roles):
+    """Require a valid token AND the user's role to be in `roles`."""
+    def decorator(f):
+        @wraps(f)
+        def decorated(*args, **kwargs):
+            db   = get_db()
+            user = current_user(db)
+            if not user:
+                return err("Authentication required", 401)
+            if user.role not in roles:
+                return err("Forbidden", 403)
+            g.current_user = user
+            return f(*args, **kwargs)
+        return decorated
+    return decorator
+
 
 # ── AUTH ──────────────────────────────────────────────────────────────────────
 
@@ -241,11 +291,17 @@ def err(msg, code=400):
 def login():
     db   = get_db()
     data = request.json or {}
-    user = db.query(User).filter_by(email=data.get("email","")).first()
-    if not user or user.password != hash_pw(data.get("password","")):
+    user = db.query(User).filter_by(email=data.get("email","").lower().strip()).first()
+    if not user or not verify_pw(user.password, data.get("password","")):
         return err("Invalid email or password", 401)
     token = secrets.token_hex(32)
     db.add(AuthToken(token=token, user_id=user.id))
+    # Purge expired tokens for this user (housekeeping)
+    cutoff = datetime.utcnow() - timedelta(days=TOKEN_TTL_DAYS)
+    db.query(AuthToken).filter(
+        AuthToken.user_id == user.id,
+        AuthToken.created_at < cutoff
+    ).delete()
     db.commit()
     return ok({"token": token, "user": user.to_dict()})
 
@@ -253,14 +309,16 @@ def login():
 def logout():
     db    = get_db()
     token = request.headers.get("X-Auth-Token","")
-    db.query(AuthToken).filter_by(token=token).delete()
-    db.commit()
+    if token:
+        db.query(AuthToken).filter_by(token=token).delete()
+        db.commit()
     return ok({"ok": True})
 
 
 # ── USERS ─────────────────────────────────────────────────────────────────────
 
 @app.route("/api/users", methods=["GET"])
+@require_role("admin")
 def list_users():
     db    = get_db()
     role  = request.args.get("role")
@@ -270,14 +328,28 @@ def list_users():
 
 @app.route("/api/users", methods=["POST"])
 def create_user():
+    """Public registration. Admins cannot be created via this endpoint."""
     db   = get_db()
     data = request.json or {}
-    if db.query(User).filter_by(email=data.get("email","")).first():
+
+    email = data.get("email","").lower().strip()
+    pw    = data.get("password","")
+    role  = data.get("role","candidate")
+
+    # Input validation
+    if not email or not EMAIL_RE.match(email):
+        return err("A valid email address is required", 400)
+    if len(pw) < 8:
+        return err("Password must be at least 8 characters", 400)
+    if role not in ALLOWED_ROLES:
+        return err("Invalid role", 400)
+    if db.query(User).filter_by(email=email).first():
         return err("Email already registered", 409)
-    uid  = data.get("id") or (data.get("role","u") + "-" + secrets.token_hex(6))
+
+    uid  = data.get("id") or (role + "-" + secrets.token_hex(6))
     user = User(
-        id=uid, email=data["email"], password=hash_pw(data["password"]),
-        role=data.get("role","candidate"), name=data.get("name",""),
+        id=uid, email=email, password=hash_pw(pw),
+        role=role, name=data.get("name",""),
         title=data.get("title",""), location=data.get("location",""),
         bio=data.get("bio",""), avatar=data.get("avatar","??"),
         joined=data.get("joined", datetime.utcnow().strftime("%Y-%m-%d")),
@@ -292,18 +364,26 @@ def create_user():
     return ok(user.to_dict(), 201)
 
 @app.route("/api/users/<uid>", methods=["GET"])
+@require_auth
 def get_user(uid):
     db   = get_db()
+    # Users can only fetch their own record; admins can fetch anyone
+    if g.current_user.role != "admin" and g.current_user.id != uid:
+        return err("Forbidden", 403)
     user = db.get(User, uid)
     if not user: return err("Not found", 404)
     return ok(user.to_dict())
 
 @app.route("/api/users/<uid>", methods=["PUT"])
+@require_auth
 def update_user(uid):
     db   = get_db()
+    # Users can only update themselves; admins can update anyone
+    if g.current_user.role != "admin" and g.current_user.id != uid:
+        return err("Forbidden", 403)
     user = db.get(User, uid)
     if not user: return err("Not found", 404)
-    data       = request.json or {}
+    data        = request.json or {}
     json_fields = {"markets","skills","work_visas","other_markets","vouch_ids"}
     protected   = {"id","email","password","role","created_at"}
     for k, v in data.items():
@@ -313,6 +393,7 @@ def update_user(uid):
     return ok(user.to_dict())
 
 @app.route("/api/users/<uid>", methods=["DELETE"])
+@require_role("admin")
 def delete_user(uid):
     db   = get_db()
     user = db.get(User, uid)
@@ -324,6 +405,7 @@ def delete_user(uid):
 # ── VOUCHES ───────────────────────────────────────────────────────────────────
 
 @app.route("/api/vouches", methods=["GET"])
+@require_auth
 def list_vouches():
     db  = get_db()
     cid = request.args.get("candidate_id")
@@ -332,13 +414,15 @@ def list_vouches():
     return ok([v.to_dict() for v in q.all()])
 
 @app.route("/api/vouches/<vid>", methods=["PUT"])
+@require_role("admin")
 def update_vouch(vid):
     db    = get_db()
     vouch = db.get(Vouch, vid)
     if not vouch: return err("Not found", 404)
     data  = request.json or {}
+    allowed = {"status","weight","verified_at","quote","duration","media_url"}
     for k, v in data.items():
-        if k != "id": setattr(vouch, k, v)
+        if k in allowed: setattr(vouch, k, v)
     db.commit()
     return ok(vouch.to_dict())
 
@@ -346,38 +430,46 @@ def update_vouch(vid):
 # ── MESSAGES ──────────────────────────────────────────────────────────────────
 
 @app.route("/api/messages", methods=["GET"])
+@require_auth
 def list_messages():
     db  = get_db()
     uid = request.args.get("user_id")
+    # Non-admins can only see their own messages
+    if g.current_user.role != "admin":
+        uid = g.current_user.id
     q   = db.query(Message)
     if uid: q = q.filter(or_(Message.from_id==uid, Message.about_candidate_id==uid))
     return ok([m.to_dict() for m in q.all()])
 
 @app.route("/api/messages", methods=["POST"])
+@require_role("hr", "admin")
 def add_message():
     db   = get_db()
     data = request.json or {}
     msg  = Message(
         id=data.get("id","msg-"+secrets.token_hex(8)),
-        from_id=data.get("from_id"), from_name=data.get("from_name",""),
+        from_id=g.current_user.id,
+        from_name=data.get("from_name",""),
         from_company=data.get("from_company",""),
         to_witness=data.get("to_witness",""),
         about_candidate_id=data.get("about_candidate_id"),
         about_candidate_name=data.get("about_candidate_name",""),
-        body=data.get("body",""), status=data.get("status","sent"),
-        created_at=data.get("created_at", datetime.utcnow().isoformat()),
+        body=data.get("body",""), status="sent",
+        created_at=datetime.utcnow().isoformat(),
     )
     db.add(msg); db.commit()
     return ok(msg.to_dict(), 201)
 
 @app.route("/api/messages/<mid>", methods=["PUT"])
+@require_role("admin")
 def update_message(mid):
     db  = get_db()
     msg = db.get(Message, mid)
     if not msg: return err("Not found", 404)
-    data = request.json or {}
+    data    = request.json or {}
+    allowed = {"reply","status","replied_at"}
     for k, v in data.items():
-        if k != "id": setattr(msg, k, v)
+        if k in allowed: setattr(msg, k, v)
     db.commit()
     return ok(msg.to_dict())
 
@@ -385,24 +477,29 @@ def update_message(mid):
 # ── VOUCH REQUESTS ────────────────────────────────────────────────────────────
 
 @app.route("/api/vouch_requests", methods=["GET"])
+@require_auth
 def list_vouch_requests():
     db  = get_db()
     cid = request.args.get("candidate_id")
+    # Non-admins can only see their own requests
+    if g.current_user.role != "admin":
+        cid = g.current_user.id
     q   = db.query(VouchRequest)
     if cid: q = q.filter_by(candidate_id=cid)
     return ok([r.to_dict() for r in q.all()])
 
 @app.route("/api/vouch_requests", methods=["POST"])
+@require_role("candidate", "admin")
 def add_vouch_request():
     db   = get_db()
     data = request.json or {}
     req  = VouchRequest(
         id=data.get("id","vr-"+secrets.token_hex(6)),
-        candidate_id=data.get("candidate_id"),
+        candidate_id=g.current_user.id,
         witness_email=data.get("witness_email",""),
         witness_name=data.get("witness_name",""),
-        status=data.get("status","sent"),
-        created_at=data.get("created_at", datetime.utcnow().isoformat()),
+        status="sent",
+        created_at=datetime.utcnow().isoformat(),
     )
     db.add(req); db.commit()
     return ok(req.to_dict(), 201)
@@ -411,42 +508,55 @@ def add_vouch_request():
 # ── PIPELINE ──────────────────────────────────────────────────────────────────
 
 @app.route("/api/pipeline", methods=["GET"])
+@require_auth
 def list_pipeline():
     db    = get_db()
     hr_id = request.args.get("hr_id")
+    # HR users can only see their own pipeline
+    if g.current_user.role == "hr":
+        hr_id = g.current_user.id
     q     = db.query(Pipeline)
     if hr_id: q = q.filter_by(hr_id=hr_id)
     return ok([p.to_dict() for p in q.all()])
 
 @app.route("/api/pipeline", methods=["POST"])
+@require_role("hr", "admin")
 def add_pipeline():
     db   = get_db()
     data = request.json or {}
+    # HR users can only add to their own pipeline
+    hr_id = g.current_user.id if g.current_user.role == "hr" else data.get("hr_id")
     item = Pipeline(
         id=data.get("id","pl-"+secrets.token_hex(6)),
-        hr_id=data.get("hr_id"), candidate_id=data.get("candidate_id"),
+        hr_id=hr_id, candidate_id=data.get("candidate_id"),
         stage=data.get("stage","Shortlisted"),
-        added_at=data.get("added_at", datetime.utcnow().strftime("%Y-%m-%d")),
+        added_at=datetime.utcnow().strftime("%Y-%m-%d"),
     )
     db.add(item); db.commit()
     return ok(item.to_dict(), 201)
 
 @app.route("/api/pipeline/<pid>", methods=["PUT"])
+@require_role("hr", "admin")
 def update_pipeline(pid):
     db   = get_db()
     item = db.get(Pipeline, pid)
     if not item: return err("Not found", 404)
+    # HR users can only update their own pipeline items
+    if g.current_user.role == "hr" and item.hr_id != g.current_user.id:
+        return err("Forbidden", 403)
     data = request.json or {}
-    for k, v in data.items():
-        if k != "id": setattr(item, k, v)
+    if "stage" in data: item.stage = data["stage"]
     db.commit()
     return ok(item.to_dict())
 
 @app.route("/api/pipeline/<pid>", methods=["DELETE"])
+@require_role("hr", "admin")
 def delete_pipeline(pid):
     db   = get_db()
     item = db.get(Pipeline, pid)
     if not item: return err("Not found", 404)
+    if g.current_user.role == "hr" and item.hr_id != g.current_user.id:
+        return err("Forbidden", 403)
     db.delete(item); db.commit()
     return ok({"deleted": pid})
 
@@ -454,26 +564,31 @@ def delete_pipeline(pid):
 # ── PROFILE VIEWS ─────────────────────────────────────────────────────────────
 
 @app.route("/api/profile_views", methods=["GET"])
+@require_auth
 def list_profile_views():
     db  = get_db()
     cid = request.args.get("candidate_id")
+    # Candidates can only see views of their own profile
+    if g.current_user.role == "candidate":
+        cid = g.current_user.id
     q   = db.query(ProfileView)
     if cid: q = q.filter_by(candidate_id=cid)
     return ok([v.to_dict() for v in q.all()])
 
 @app.route("/api/profile_views", methods=["POST"])
+@require_role("hr", "admin")
 def add_profile_view():
     db   = get_db()
     data = request.json or {}
     pv   = ProfileView(
         id=data.get("id","pv-"+secrets.token_hex(6)),
         candidate_id=data.get("candidate_id"),
-        hr_id=data.get("hr_id"),
+        hr_id=g.current_user.id,
         hr_name=data.get("hr_name",""), hr_initials=data.get("hr_initials",""),
         hr_color=data.get("hr_color","#065F46"),
         hr_company=data.get("hr_company",""), hr_title=data.get("hr_title",""),
-        viewed_at=data.get("viewed_at", datetime.utcnow().isoformat()),
-        read=data.get("read", False),
+        viewed_at=datetime.utcnow().isoformat(),
+        read=False,
     )
     db.add(pv)
     # bump candidate's profile_views_count
@@ -483,20 +598,34 @@ def add_profile_view():
     return ok(pv.to_dict(), 201)
 
 @app.route("/api/profile_views/<pvid>", methods=["PUT"])
+@require_auth
 def update_profile_view(pvid):
     db = get_db()
     pv = db.get(ProfileView, pvid)
     if not pv: return err("Not found", 404)
+    # Only the candidate whose profile was viewed can mark it read
+    if g.current_user.role == "candidate" and pv.candidate_id != g.current_user.id:
+        return err("Forbidden", 403)
     data = request.json or {}
-    for k, v in data.items():
-        if k != "id": setattr(pv, k, v)
+    if "read" in data: pv.read = bool(data["read"])
     db.commit()
     return ok(pv.to_dict())
+
+@app.route("/api/profile_views/mark_all_read", methods=["POST"])
+@require_auth
+def mark_all_views_read():
+    """Batch-mark all of a candidate's profile views as read."""
+    db  = get_db()
+    cid = g.current_user.id
+    db.query(ProfileView).filter_by(candidate_id=cid, read=False).update({"read": True})
+    db.commit()
+    return ok({"ok": True})
 
 
 # ── STATS ─────────────────────────────────────────────────────────────────────
 
 @app.route("/api/stats", methods=["GET"])
+@require_role("admin")
 def stats():
     db = get_db()
     candidates     = db.query(User).filter_by(role="candidate").all()
@@ -523,16 +652,49 @@ def stats():
 # ── FULL SYNC (initial data load for the frontend cache) ─────────────────────
 
 @app.route("/api/sync", methods=["GET"])
+@require_auth
 def sync():
-    """One-shot endpoint: returns everything the frontend needs to bootstrap."""
-    db = get_db()
+    """
+    One-shot endpoint: returns everything the authenticated user needs.
+    - admin: all data
+    - hr:    all candidates + own pipeline/messages/profile_views
+    - candidate: own data + own vouches/vouch_requests/profile_views
+    """
+    db   = get_db()
+    user = g.current_user
+
+    if user.role == "admin":
+        users          = [u.to_dict() for u in db.query(User).all()]
+        vouches        = [v.to_dict() for v in db.query(Vouch).all()]
+        messages       = [m.to_dict() for m in db.query(Message).all()]
+        vouch_requests = [r.to_dict() for r in db.query(VouchRequest).all()]
+        pipeline       = [p.to_dict() for p in db.query(Pipeline).all()]
+        profile_views  = [v.to_dict() for v in db.query(ProfileView).all()]
+
+    elif user.role == "hr":
+        # HR sees all candidates (for search), their own pipeline and messages
+        users          = [u.to_dict() for u in db.query(User).filter(
+                            User.role.in_(["candidate","hr"])).all()]
+        vouches        = [v.to_dict() for v in db.query(Vouch).all()]
+        messages       = [m.to_dict() for m in db.query(Message).filter(
+                            Message.from_id == user.id).all()]
+        vouch_requests = []
+        pipeline       = [p.to_dict() for p in db.query(Pipeline).filter_by(hr_id=user.id).all()]
+        profile_views  = [v.to_dict() for v in db.query(ProfileView).filter_by(hr_id=user.id).all()]
+
+    else:  # candidate
+        users          = [user.to_dict()]   # own record only
+        vouches        = [v.to_dict() for v in db.query(Vouch).filter_by(candidate_id=user.id).all()]
+        messages       = [m.to_dict() for m in db.query(Message).filter(
+                            Message.about_candidate_id == user.id).all()]
+        vouch_requests = [r.to_dict() for r in db.query(VouchRequest).filter_by(candidate_id=user.id).all()]
+        pipeline       = []
+        profile_views  = [v.to_dict() for v in db.query(ProfileView).filter_by(candidate_id=user.id).all()]
+
     return ok({
-        "users":          [u.to_dict() for u in db.query(User).all()],
-        "vouches":        [v.to_dict() for v in db.query(Vouch).all()],
-        "messages":       [m.to_dict() for m in db.query(Message).all()],
-        "vouch_requests": [r.to_dict() for r in db.query(VouchRequest).all()],
-        "pipeline":       [p.to_dict() for p in db.query(Pipeline).all()],
-        "profile_views":  [v.to_dict() for v in db.query(ProfileView).all()],
+        "users": users, "vouches": vouches, "messages": messages,
+        "vouch_requests": vouch_requests, "pipeline": pipeline,
+        "profile_views": profile_views,
     })
 
 
@@ -543,4 +705,5 @@ def create_tables():
 
 if __name__ == "__main__":
     create_tables()
-    app.run(debug=True, port=5001, host="0.0.0.0")
+    debug = os.environ.get("FLASK_DEBUG", "0") == "1"
+    app.run(debug=debug, port=5001, host="0.0.0.0")

@@ -1,5 +1,6 @@
 flask>=3.0
 flask-cors>=4.0
 sqlalchemy>=2.0
+werkzeug>=3.0      # secure password hashing (pbkdf2:sha256)
 pymysql>=1.1       # MySQL driver — not needed for SQLite
 python-dotenv>=1.0
