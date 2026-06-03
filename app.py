@@ -805,7 +805,7 @@ def sync():
         vouch_requests = [r.to_dict() for r in db.query(VouchRequest).filter_by(candidate_id=user.id).all()]
         pipeline       = []
         profile_views  = [v.to_dict() for v in db.query(ProfileView).filter_by(candidate_id=user.id).all()]
-        jobs           = []
+        jobs           = [j.to_dict() for j in db.query(Job).filter_by(status="open").all()]
 
     return ok({
         "users": users, "vouches": vouches, "messages": messages,
