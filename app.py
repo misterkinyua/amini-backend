@@ -206,6 +206,41 @@ class ProfileView(Base):
         }
 
 
+class Job(Base):
+    __tablename__ = "jobs"
+    id               = Column(String(60),  primary_key=True)
+    hr_id            = Column(String(60),  ForeignKey("users.id"))
+    title            = Column(String(255), nullable=False)
+    company          = Column(String(255))
+    location         = Column(String(255))
+    description      = Column(Text)
+    required_skills  = Column(Text)   # JSON array
+    nice_skills      = Column(Text)   # JSON array
+    markets          = Column(Text)   # JSON array
+    min_ubuntu_score = Column(Integer, default=0)
+    salary_min_key   = Column(String(50))
+    salary_max_key   = Column(String(50))
+    employment_type  = Column(String(50), default="full_time")
+    status           = Column(String(20), default="open")
+    created_at       = Column(String(30))
+
+    def to_dict(self):
+        return {
+            "id": self.id, "hr_id": self.hr_id,
+            "title": self.title, "company": self.company,
+            "location": self.location, "description": self.description,
+            "required_skills": json.loads(self.required_skills or "[]"),
+            "nice_skills":     json.loads(self.nice_skills     or "[]"),
+            "markets":         json.loads(self.markets         or "[]"),
+            "min_ubuntu_score": self.min_ubuntu_score or 0,
+            "salary_min_key":  self.salary_min_key,
+            "salary_max_key":  self.salary_max_key,
+            "employment_type": self.employment_type or "full_time",
+            "status":          self.status or "open",
+            "created_at":      self.created_at,
+        }
+
+
 class AuthToken(Base):
     __tablename__ = "auth_tokens"
     token      = Column(String(128), primary_key=True)
@@ -622,6 +657,84 @@ def mark_all_views_read():
     return ok({"ok": True})
 
 
+# ── JOBS ──────────────────────────────────────────────────────────────────────
+
+@app.route("/api/jobs", methods=["GET"])
+@require_role("hr", "admin")
+def list_jobs():
+    db   = get_db()
+    q    = db.query(Job)
+    if g.current_user.role == "hr":
+        q = q.filter_by(hr_id=g.current_user.id)
+    return ok([j.to_dict() for j in q.all()])
+
+@app.route("/api/jobs", methods=["POST"])
+@require_role("hr", "admin")
+def create_job():
+    db   = get_db()
+    data = request.json or {}
+    if not (data.get("title","")).strip():
+        return err("Job title is required", 400)
+    hr_id = g.current_user.id if g.current_user.role == "hr" else data.get("hr_id", g.current_user.id)
+    job   = Job(
+        id=data.get("id", "job-" + secrets.token_hex(8)),
+        hr_id=hr_id,
+        title=data.get("title","").strip(),
+        company=data.get("company",""),
+        location=data.get("location",""),
+        description=data.get("description",""),
+        required_skills=json.dumps(data.get("required_skills",[])),
+        nice_skills=json.dumps(data.get("nice_skills",[])),
+        markets=json.dumps(data.get("markets",[])),
+        min_ubuntu_score=data.get("min_ubuntu_score",0),
+        salary_min_key=data.get("salary_min_key",""),
+        salary_max_key=data.get("salary_max_key",""),
+        employment_type=data.get("employment_type","full_time"),
+        status=data.get("status","open"),
+        created_at=datetime.utcnow().isoformat(),
+    )
+    db.add(job); db.commit()
+    return ok(job.to_dict(), 201)
+
+@app.route("/api/jobs/<jid>", methods=["GET"])
+@require_role("hr", "admin")
+def get_job(jid):
+    db  = get_db()
+    job = db.get(Job, jid)
+    if not job: return err("Not found", 404)
+    if g.current_user.role == "hr" and job.hr_id != g.current_user.id:
+        return err("Forbidden", 403)
+    return ok(job.to_dict())
+
+@app.route("/api/jobs/<jid>", methods=["PUT"])
+@require_role("hr", "admin")
+def update_job(jid):
+    db  = get_db()
+    job = db.get(Job, jid)
+    if not job: return err("Not found", 404)
+    if g.current_user.role == "hr" and job.hr_id != g.current_user.id:
+        return err("Forbidden", 403)
+    data        = request.json or {}
+    json_fields = {"required_skills", "nice_skills", "markets"}
+    protected   = {"id", "hr_id", "created_at"}
+    for k, v in data.items():
+        if k in protected: continue
+        setattr(job, k, json.dumps(v) if k in json_fields else v)
+    db.commit()
+    return ok(job.to_dict())
+
+@app.route("/api/jobs/<jid>", methods=["DELETE"])
+@require_role("hr", "admin")
+def delete_job(jid):
+    db  = get_db()
+    job = db.get(Job, jid)
+    if not job: return err("Not found", 404)
+    if g.current_user.role == "hr" and job.hr_id != g.current_user.id:
+        return err("Forbidden", 403)
+    db.delete(job); db.commit()
+    return ok({"deleted": jid})
+
+
 # ── STATS ─────────────────────────────────────────────────────────────────────
 
 @app.route("/api/stats", methods=["GET"])
@@ -670,9 +783,10 @@ def sync():
         vouch_requests = [r.to_dict() for r in db.query(VouchRequest).all()]
         pipeline       = [p.to_dict() for p in db.query(Pipeline).all()]
         profile_views  = [v.to_dict() for v in db.query(ProfileView).all()]
+        jobs           = [j.to_dict() for j in db.query(Job).all()]
 
     elif user.role == "hr":
-        # HR sees all candidates (for search), their own pipeline and messages
+        # HR sees all candidates (for search), their own pipeline, messages, and jobs
         users          = [u.to_dict() for u in db.query(User).filter(
                             User.role.in_(["candidate","hr"])).all()]
         vouches        = [v.to_dict() for v in db.query(Vouch).all()]
@@ -681,6 +795,7 @@ def sync():
         vouch_requests = []
         pipeline       = [p.to_dict() for p in db.query(Pipeline).filter_by(hr_id=user.id).all()]
         profile_views  = [v.to_dict() for v in db.query(ProfileView).filter_by(hr_id=user.id).all()]
+        jobs           = [j.to_dict() for j in db.query(Job).filter_by(hr_id=user.id).all()]
 
     else:  # candidate
         users          = [user.to_dict()]   # own record only
@@ -690,11 +805,12 @@ def sync():
         vouch_requests = [r.to_dict() for r in db.query(VouchRequest).filter_by(candidate_id=user.id).all()]
         pipeline       = []
         profile_views  = [v.to_dict() for v in db.query(ProfileView).filter_by(candidate_id=user.id).all()]
+        jobs           = []
 
     return ok({
         "users": users, "vouches": vouches, "messages": messages,
         "vouch_requests": vouch_requests, "pipeline": pipeline,
-        "profile_views": profile_views,
+        "profile_views": profile_views, "jobs": jobs,
     })
 
 
